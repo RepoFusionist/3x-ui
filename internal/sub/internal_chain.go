@@ -2,6 +2,7 @@ package sub
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -93,7 +94,7 @@ func chainPayload(doc map[string]any, name string) ([]any, error) {
 	return payload, nil
 }
 
-func mergeInternalChain(base, doc map[string]any) (map[string]any, error) {
+func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (map[string]any, error) {
 	entries, err := chainPayload(doc, chainEntryProvider)
 	if err != nil {
 		return nil, err
@@ -107,13 +108,32 @@ func mergeInternalChain(base, doc map[string]any) (map[string]any, error) {
 		return nil, errors.New("internal chain requires verified HTTPS")
 	}
 	known := map[string]bool{chainExitName: true, chainAutoGroup: true}
-	for _, value := range entries {
+	converted := make([]any, 0, len(entries))
+	for index, value := range entries {
 		node, _ := value.(map[string]any)
+		if rawLink, ok := node["link"].(string); ok {
+			name := linkDisplayName(rawLink)
+			if name == "" {
+				name = fmt.Sprintf("节点-%02d", index+1)
+			}
+			node = converter.clashProxyFromExternal(rawLink, "101入口 · "+name)
+			if node == nil {
+				continue
+			}
+		}
 		name, _ := node["name"].(string)
-		if !strings.HasPrefix(name, "101入口 · ") || known[name] || node["dialer-proxy"] != nil {
+		if !strings.HasPrefix(name, "101入口 · ") || node["dialer-proxy"] != nil {
 			return nil, errors.New("internal chain entry rejected")
 		}
+		if known[name] {
+			name = fmt.Sprintf("%s (%d)", name, index+1)
+			node["name"] = name
+		}
 		known[name] = true
+		converted = append(converted, node)
+	}
+	if len(converted) == 0 {
+		return nil, errors.New("internal chain has no supported entry nodes")
 	}
 	var automatic map[string]any
 	groups, _ := asAnySlice(doc["proxy-groups"])
@@ -153,7 +173,9 @@ func mergeInternalChain(base, doc map[string]any) (map[string]any, error) {
 		return nil, errors.New("internal chain provider collision")
 	}
 	providers, _ := doc["proxy-providers"].(map[string]any)
-	existing[chainEntryProvider] = providers[chainEntryProvider]
+	entryProvider, _ := providers[chainEntryProvider].(map[string]any)
+	entryProvider["payload"] = converted
+	existing[chainEntryProvider] = entryProvider
 	existing[chainExitProvider] = providers[chainExitProvider]
 	result["proxy-providers"] = existing
 	ownGroups, _ := asAnySlice(result["proxy-groups"])
@@ -192,7 +214,7 @@ func applyInternalChain(base map[string]any, source string) map[string]any {
 	doc, err := fetchInternalChain(source)
 	if err == nil {
 		var merged map[string]any
-		merged, err = mergeInternalChain(base, doc)
+		merged, err = mergeInternalChain(base, doc, &SubClashService{})
 		if err == nil {
 			return merged
 		}
