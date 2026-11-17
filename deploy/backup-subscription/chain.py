@@ -27,6 +27,16 @@ def validate_subscription_url(source_url):
     if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
         raise ValueError('invalid upstream URL')
     try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return
+    if not address.is_global:
+        raise ValueError('non-public upstream address')
+
+
+def validate_public_dns(source_url):
+    parsed = urllib.parse.urlsplit(source_url)
+    try:
         addresses = {ipaddress.ip_address(parsed.hostname)}
     except ValueError:
         addresses = {ipaddress.ip_address(item[4][0]) for item in
@@ -154,6 +164,7 @@ class ChainCache:
 
     def _refresh_source(self, source_url, cache_path):
         try:
+            validate_public_dns(source_url)
             request = urllib.request.Request(source_url, headers={
                 'User-Agent': 'clash.meta', 'Accept': 'application/yaml'})
             opener = urllib.request.build_opener(self.redirect_handler())

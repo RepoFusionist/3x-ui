@@ -146,7 +146,11 @@ def make_handler(cache):
                 self.reply(404, b'not found\n')
                 return
             if 'chain' in cache.config:
-                prepared, status = cache.snapshot(source_url)
+                try:
+                    prepared, status = cache.snapshot(source_url)
+                except Exception:
+                    self.reply(503, b'no usable chain cache\n')
+                    return
                 if route == 'health':
                     self.reply(200 if status['ready'] else 503,
                                json.dumps(status, ensure_ascii=False).encode(), 'application/json')
