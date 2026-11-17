@@ -115,8 +115,10 @@ export default function OutboundFormModal({
     | string
     | undefined;
 
-  const streamAllowed = canEnableStream({ protocol });
-  const tlsAllowed = canEnableOutboundTls({ protocol, streamSettings: { network, security } });
+  const streamAllowed = protocol === 'http' || canEnableStream({ protocol });
+  const tlsAllowed =
+    (protocol === 'http' && (!network || network === 'tcp' || network === 'raw')) ||
+    canEnableOutboundTls({ protocol, streamSettings: { network, security } });
   const realityAllowed = canEnableReality({ protocol, streamSettings: { network, security } });
   const tlsFlowAllowed = canEnableTlsFlow({
     protocol,
@@ -160,6 +162,7 @@ export default function OutboundFormModal({
 
   useEffect(() => {
     if (!streamAllowed) return;
+    if (methods.getValues('protocol') !== protocol) return;
     /*
      * Wireguard dials its own UDP — only finalmask/sockopt apply, never a
      * transport. Don't seed network 'tcp'; clear a leftover one (from a
@@ -170,9 +173,12 @@ export default function OutboundFormModal({
       return;
     }
     if (network) return;
+    const existing = methods.getValues('streamSettings') ?? {};
     methods.setValue('streamSettings', {
       ...newStreamSlice('tcp'),
-      security: 'none',
+      ...(protocol === 'http' ? existing : {}),
+      network: 'tcp',
+      security: protocol === 'http' ? (existing.security ?? 'none') : 'none',
     } as StreamValue);
   }, [streamAllowed, network, protocol, methods]);
 
@@ -650,3 +656,4 @@ export default function OutboundFormModal({
     </>
   );
 }
+

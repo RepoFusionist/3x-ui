@@ -881,7 +881,7 @@ function loopbackToWire(s: LoopbackOutboundFormSettings) {
 
 // canEnableMux mirrors the legacy Outbound.canEnableMux().
 const MUX_PROTOCOLS = new Set(['vmess', 'vless', 'trojan', 'shadowsocks', 'http', 'socks']);
-const STREAM_PROTOCOLS = new Set(['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria', 'masque']);
+const STREAM_PROTOCOLS = new Set(['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria', 'masque', 'http']);
 
 function dropEmptyStrings(obj: Raw): Raw {
   const out: Raw = {};
@@ -1035,3 +1035,4 @@ export function formValuesToWirePayload(values: OutboundFormValues): WireOutboun
   }
   return result;
 }
+
