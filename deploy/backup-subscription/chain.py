@@ -21,6 +21,12 @@ EXIT_PROVIDER = '101出口节点'
 AUTO_GROUP = '101自动'
 EXIT_NAME = '备用线路-美国'
 PREFIX = '101入口 · '
+INFO_MARKERS = ('剩余流量', '流量剩余', '剩餘流量', '到期时间', '到期日期',
+                '订阅到期', '套餐到期', '过期时间', '重置时间', '下次重置')
+
+
+def is_info_name(name):
+    return any(marker in name for marker in INFO_MARKERS)
 
 
 def validate_subscription_url(source_url):
@@ -59,6 +65,17 @@ def prepare_share_subscription(body):
             continue
         if not urllib.parse.urlsplit(line).scheme or '://' not in line:
             raise ValueError('unsupported share link')
+        parsed = urllib.parse.urlsplit(line)
+        name = urllib.parse.unquote(parsed.fragment)
+        if parsed.scheme == 'vmess':
+            try:
+                token = line[len('vmess://'):]
+                decoded = base64.b64decode(token + '=' * (-len(token) % 4), altchars=b'-_')
+                name = str(json.loads(decoded).get('ps', name))
+            except (ValueError, TypeError, UnicodeError):
+                pass
+        if is_info_name(name):
+            continue
         if line not in links:
             links.append(line)
     if not links or len(links) > 512:
@@ -66,7 +83,7 @@ def prepare_share_subscription(body):
     return {'proxies': [{'link': link} for link in links],
             'group': {'name': AUTO_GROUP, 'type': 'url-test', 'hidden': False,
                       'use': [ENTRY_PROVIDER], 'url': 'https://www.gstatic.com/generate_204',
-                      'interval': 300}}
+                      'interval': 300, 'lazy': False}}
 
 
 def prepare_upstream(document, automatic_name='自动选择'):
@@ -93,6 +110,8 @@ def prepare_upstream(document, automatic_name='自动选择'):
     for name in dict.fromkeys(selected):
         if name not in by_name:
             raise ValueError('automatic member is not a concrete proxy')
+        if is_info_name(name):
+            continue
         proxy = copy.deepcopy(by_name[name])
         if any(key in proxy for key in ('dialer-proxy', 'interface-name', 'routing-mark')):
             raise ValueError('unexpected upstream dialer')
@@ -100,10 +119,13 @@ def prepare_upstream(document, automatic_name='自动选择'):
             raise ValueError('incomplete proxy')
         proxy['name'] = PREFIX + name
         proxies.append(proxy)
+    if not proxies:
+        raise ValueError('automatic group has no usable nodes')
     group = {key: copy.deepcopy(automatic[key]) for key in
              ('url', 'interval', 'tolerance', 'timeout', 'lazy', 'expected-status')
              if key in automatic}
     group.update(name=AUTO_GROUP, type='url-test', hidden=False, use=[ENTRY_PROVIDER])
+    group['lazy'] = False
     group.setdefault('url', 'https://www.gstatic.com/generate_204')
     group.setdefault('interval', 300)
     return {'proxies': proxies, 'group': group}
@@ -171,6 +193,8 @@ class ChainCache:
     def _load_entry(self, source_url, path=None):
         try:
             entry = json.loads((path or self._cache_path(source_url)).read_text())
+            if entry.get('version') != 2:
+                raise ValueError('stale cache format')
             generate(entry['prepared'], self.config['chain']['exit'])
             with self.lock:
                 self.entries[source_url] = entry
@@ -212,7 +236,7 @@ class ChainCache:
             else:
                 prepared = prepare_upstream(body)
             generate(prepared, self.config['chain']['exit'])
-            entry = {'prepared': prepared, 'fetched_at': time.time()}
+            entry = {'version': 2, 'prepared': prepared, 'fetched_at': time.time()}
             temp = cache_path.with_suffix('.tmp')
             with temp.open('w', encoding='utf-8') as stream:
                 os.chmod(temp, 0o600)
