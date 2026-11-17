@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 12511)
+Total output lines: 1744
+
 package sub
 
 import (
@@ -7,6 +10,7 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/goccy/go-json"
@@ -19,15 +23,16 @@ import (
 )
 
 type SubClashService struct {
-	enableRouting bool
-	clashRules    string
-	SubService    *SubService
+	enableRouting  bool
+	clashRules     string
+	clashRemoteDNS bool
+	SubService     *SubService
 }
 
 var errNoLegacyClashProxies = errors.New("no Clash for Windows-compatible proxies found; use the Mihomo subscription for modern proxy types")
 
-func NewSubClashService(enableRouting bool, clashRules string, subService *SubService) *SubClashService {
-	return &SubClashService{enableRouting: enableRouting, clashRules: clashRules, SubService: subService}
+func NewSubClashService(enableRouting bool, clashRules string, clashRemoteDNS bool, subService *SubService) *SubClashService {
+	return &SubClashService{enableRouting: enableRouting, clashRules: clashRules, clashRemoteDNS: clashRemoteDNS, SubService: subService}
 }
 
 func (s *SubClashService) GetClash(subId string, host string) (string, string, error) {
@@ -52,9 +57,15 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 	if len(inbounds) == 0 && len(externalLinks) == 0 {
 		return "", "", nil
 	}
+	chainSource, chainRequested := internalChainSubscriptionSource(externalLinks)
+	if legacy {
+		chainRequested = false
+	}
 
 	var proxies []map[string]any
+	var ordered []orderedSubEntry[func() []map[string]any]
 	var hasInactiveExternal bool
+	var hasBoundClosed bool
 	var hasEnabledClient bool
 
 	seenEmails := make(map[string]struct{})
@@ -70,15 +81,44 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 			continue
 		}
 		subReq.projectThroughFallbackMaster(inbound)
-		if hostEps := subReq.hostEndpoints(inbound, "clash"); len(hostEps) > 0 {
-			injectExternalProxy(inbound, hostEps)
+		var baseEps []map[string]any
+		baseStream := inbound.StreamSettings
+		if !subReq.hostsFirst {
+			if baseEps = subReq.hostEndpoints(inbound, "clash"); len(baseEps) > 0 {
+				injectExternalProxy(inbound, baseEps)
+			}
 		}
 		for _, client := range clients {
 			if client.Enable {
 				hasEnabledClient = true
 			}
 			seenEmails[client.Email] = struct{}{}
-			proxies = append(proxies, s.getProxies(subReq, inbound, client, host)...)
+			if subReq.hostsFirst {
+				variants, closed := subReq.clientHostVariants(inbound, client, "clash")
+				hasBoundClosed = hasBoundClosed || closed
+				for _, variant := range variants {
+					render := func() []map[string]any { return s.getProxies(subReq, variant.inbound(subReq, inbound), client, host) }
+					ordered = append(ordered, orderedSubEntry[func() []map[string]any]{variant.order, render})
+				}
+				continue
+			}
+			effective := inbound
+			if effectiveEps, bound := subReq.clientHostEndpoints(inbound, client, "clash", baseEps); bound {
+				if len(effectiveEps) == 0 {
+					hasBoundClosed = true
+					continue
+				}
+				clone := *inbound
+				clone.StreamSettings = baseStream
+				injectExternalProxy(&clone, effectiveEps)
+				effective = &clone
+			}
+			proxies = append(proxies, s.getProxies(subReq, effective, client, host)...)
+		}
+	}
+	if subReq.hostsFirst {
+		for _, render := range orderedSubValues(ordered) {
+			proxies = append(proxies, render()...)
 		}
 	}
 	for _, ext := range externalLinks {
@@ -103,7 +143,7 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 		}
 	}
 
-	if len(proxies) == 0 && !hasInactiveExternal {
+	if len(proxies) == 0 && !hasInactiveExternal && !hasBoundClosed && !chainRequested {
 		return "", "", nil
 	}
 	if legacy {
@@ -122,7 +162,7 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 	traffic.Enable = hasEnabledClient
 	header := subReq.subscriptionUserinfo(traffic)
 
-	if mode, remark := subReq.resolveInfoNodeRemark(subId, emails, traffic, len(proxies) > 0); mode != infoNodeNone {
+	if mode, remark := subReq.resolveInfoNodeRemark(subId, emails, traffic, len(proxies) > 0 || chainRequested); mode != infoNodeNone {
 		dummyProxy := map[string]any{
 			"name":   remark,
 			"type":   "socks5",
@@ -130,13 +170,14 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 			"port":   1080,
 		}
 		if mode == infoNodeExpired || mode == infoNodeDepleted {
+			chainRequested = false
 			proxies = []map[string]any{dummyProxy}
 		} else {
 			proxies = append([]map[string]any{dummyProxy}, proxies...)
 		}
 	}
 
-	if len(proxies) == 0 {
+	if len(proxies) == 0 && !chainRequested {
 		return "", header, nil
 	}
 
@@ -169,13 +210,16 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 		resolved, remoteDocument, remote, resolveErr := resolveClashRoutingSource(s.clashRules)
 		if resolveErr == nil && strings.TrimSpace(resolved) != "" {
 			if remote {
-				if err := mergeRemoteClashRules(config, remoteDocument); err != nil {
+				if err := mergeRemoteClashRules(config, remoteDocument, s.clashRemoteDNS); err != nil {
 					return "", "", err
 				}
 			} else if err := mergeClashRulesYAML(config, resolved); err != nil {
 				return "", "", err
 			}
 		}
+	}
+	if chainRequested {
+		config = applyInternalChain(config, chainSource)
 	}
 
 	finalYAML, err := marshalClashYAML(config)
@@ -227,6 +271,10 @@ func legacyClashProxy(proxy map[string]any) map[string]any {
 		tls, _ := proxy["tls"].(bool)
 		cipher = legacyShadowsocksCipher(proxy["cipher"])
 		if (network != "" && network != "tcp") || tls || cipher == "" {
+			return nil
+		}
+		// Legacy endpoints directly block obfs nodes.
+		if plugin, _ := proxy["plugin"].(string); plugin == "obfs" {
 			return nil
 		}
 		fields = []string{"name", "type", "server", "port", "password", "cipher", "udp", "plugin", "plugin-opts"}
@@ -395,6 +443,13 @@ func (s *SubClashService) getProxies(subReq *SubService, inbound *model.Inbound,
 			if v, _ := extPrxy["mihomoIpVersion"].(string); v != "" {
 				proxy["ip-version"] = v
 			}
+			// A pre-26.9.8 core accepts a plain X25519 hello, which some DPI lets
+			// through where it drops the two-segment ML-KEM one.
+			if hostX25519Only(extPrxy) {
+				if opts, ok := proxy["reality-opts"].(map[string]any); ok {
+					opts["support-x25519mlkem768"] = false
+				}
+			}
 			proxies = append(proxies, proxy)
 		}
 	}
@@ -424,9 +479,6 @@ func (s *SubClashService) buildProxy(subReq *SubService, inbound *model.Inbound,
 		"server": inbound.Listen,
 		"port":   inbound.Port,
 		"udp":    true,
-	}
-	if !s.applyTransport(proxy, network, stream) {
-		return nil
 	}
 
 	switch inbound.Protocol {
@@ -467,6 +519,10 @@ func (s *SubClashService) buildProxy(subReq *SubService, inbound *model.Inbound,
 			}
 		}
 	default:
+		return nil
+	}
+
+	if !s.applyTransport(proxy, network, stream) {
 		return nil
 	}
 
@@ -540,8 +596,8 @@ func (s *SubClashService) buildHysteriaProxy(subReq *SubService, inbound *model.
 		proxy["fingerprint"] = certFingerprint
 	}
 
-	// Salamander obfs (Hysteria2). Read the same finalmask.udp[salamander]
-	// block the subscription link generator uses.
+	// Salamander obfs (Hysteria2), read from the same finalmask.udp[salamander]
+	// block as the link generator; a packetSize range is mihomo's gecko obfs.
 	if finalmask, ok := rawStream["finalmask"].(map[string]any); ok {
 		if udpMasks, ok := finalmask["udp"].([]any); ok {
 			for _, m := range udpMasks {
@@ -553,6 +609,13 @@ func (s *SubClashService) buildHysteriaProxy(subReq *SubService, inbound *model.
 				if pw, ok := settings["password"].(string); ok && pw != "" {
 					proxy["obfs"] = "salamander"
 					proxy["obfs-password"] = pw
+					packetSize, _ := settings["packetSize"].(string)
+					if gecko := parseHysteriaPacketSize(packetSize); gecko != "" {
+						minStr, maxStr := splitHysteriaPacketSize(gecko)
+						proxy["obfs"] = "gecko"
+						proxy["obfs-min-packet-size"], _ = strconv.Atoi(minStr)
+						proxy["obfs-max-packet-size"], _ = strconv.Atoi(maxStr)
+					}
 					break
 				}
 			}
@@ -602,366 +665,7 @@ func mihomoCertFingerprint(value any) string {
 			}
 			out.WriteString(normalized[i : i+2])
 		}
-		return out.String()
-	}
-	return ""
-}
-
-// buildWireguardProxy produces a mihomo-compatible Clash entry for a native
-// WireGuard inbound, mirroring genWireguardLink: the peer public key is derived
-// from the inbound secretKey, while the private key, tunnel address, and
-// pre-shared key come from the client. Returns nil when the client has no key.
-func (s *SubClashService) buildWireguardProxy(subReq *SubService, inbound *model.Inbound, client model.Client, ep map[string]any) map[string]any {
-	if client.PrivateKey == "" {
-		return nil
-	}
-
-	var inboundSettings map[string]any
-	_ = json.Unmarshal([]byte(inbound.Settings), &inboundSettings)
-	secretKey, _ := inboundSettings["secretKey"].(string)
-
-	proxy := map[string]any{
-		"name":        subReq.endpointRemark(inbound, client.Email, ep, ""),
-		"type":        "wireguard",
-		"server":      inbound.Listen,
-		"port":        inbound.Port,
-		"udp":         true,
-		"private-key": client.PrivateKey,
-	}
-	if secretKey != "" {
-		if pub, err := wgutil.PublicKeyFromPrivate(secretKey); err == nil {
-			proxy["public-key"] = pub
-		}
-	}
-	if client.PreSharedKey != "" {
-		proxy["pre-shared-key"] = client.PreSharedKey
-	}
-	if ka := client.KeepAliveSeconds(); ka > 0 {
-		proxy["persistent-keepalive"] = ka
-	}
-	for _, addr := range client.AllowedIPs {
-		ip := stripCIDR(addr)
-		if ip == "" {
-			continue
-		}
-		if strings.Contains(ip, ":") {
-			proxy["ipv6"] = ip
-		} else {
-			proxy["ip"] = ip
-		}
-	}
-	if mtu, ok := inboundSettings["mtu"].(float64); ok && mtu > 0 {
-		proxy["mtu"] = int(mtu)
-	}
-	if dns, _ := inboundSettings["dns"].(string); dns != "" {
-		servers := make([]string, 0)
-		for server := range strings.SplitSeq(dns, ",") {
-			if server = strings.TrimSpace(server); server != "" {
-				servers = append(servers, server)
-			}
-		}
-		if len(servers) > 0 {
-			proxy["dns"] = servers
-		}
-	}
-
-	return proxy
-}
-
-func (s *SubClashService) buildTuicProxy(subReq *SubService, inbound *model.Inbound, client model.Client, ep map[string]any) map[string]any {
-	inst, ok := tuic.InstanceFromInbound(inbound)
-	if !ok {
-		return nil
-	}
-	uuid := client.ID
-	password := client.Password
-	for _, c := range inst.Clients {
-		if c.Email == client.Email {
-			if uuid == "" {
-				uuid = c.UUID
-			}
-			if password == "" {
-				password = c.Password
-			}
-			break
-		}
-	}
-	if uuid == "" || password == "" {
-		return nil
-	}
-	server := inbound.Listen
-	if server == "" || server == "0.0.0.0" || server == "::" {
-		server = subReq.resolveInboundAddress(inbound)
-	}
-	proxy := map[string]any{
-		"name":                  subReq.endpointRemark(inbound, client.Email, ep, "tuic"),
-		"type":                  "tuic",
-		"server":                server,
-		"port":                  inbound.Port,
-		"uuid":                  uuid,
-		"password":              password,
-		"congestion-controller": inst.CongestionControl,
-		"udp-relay-mode":        inst.UDPRelayMode,
-		"reduce-rtt":            inst.ZeroRTTHandshake,
-	}
-	if len(inst.ALPN) > 0 {
-		proxy["alpn"] = inst.ALPN
-	}
-	if inst.SNI != "" {
-		proxy["sni"] = inst.SNI
-	}
-	if sni, ok := externalProxySNI(ep); ok {
-		proxy["sni"] = sni
-	}
-	if alpn, ok := externalProxyALPN(ep["alpn"]); ok {
-		proxy["alpn"] = strings.Split(alpn, ",")
-	}
-	if ai, ok := ep["allowInsecure"].(bool); ok && ai {
-		proxy["skip-cert-verify"] = true
-	}
-	return proxy
-}
-
-// amneziaWGClientAddresses prefers this inbound's own settings entry over the
-// shared clients.wg_allowed_ips column, which for an identity attached to both
-// a wireguard and an amneziawg inbound holds the other one's address.
-func amneziaWGClientAddresses(settingsClients []model.Client, client model.Client) []string {
-	for i := range settingsClients {
-		if !strings.EqualFold(settingsClients[i].Email, client.Email) {
-			continue
-		}
-		if len(settingsClients[i].AllowedIPs) > 0 {
-			return settingsClients[i].AllowedIPs
-		}
-		break
-	}
-	return client.AllowedIPs
-}
-
-// allBareIPs reports whether every entry is a plain IP address — no port,
-// scheme, and no zone, which mihomo brackets into a udp:// URL it then rejects.
-func allBareIPs(servers []string) bool {
-	for _, s := range servers {
-		addr, err := netip.ParseAddr(s)
-		if err != nil || addr.Zone() != "" {
-			return false
-		}
-	}
-	return true
-}
-
-// buildAmneziaWGProxy emits a mihomo Clash entry for an AmneziaWG inbound:
-// type stays "wireguard", the obfuscation rides in amnezia-wg-option.
-func (s *SubClashService) buildAmneziaWGProxy(subReq *SubService, inbound *model.Inbound, client model.Client, ep map[string]any) map[string]any {
-	if client.PrivateKey == "" {
-		return nil
-	}
-
-	var parsed amneziawg.InboundSettings
-	if err := json.Unmarshal([]byte(inbound.Settings), &parsed); err != nil || parsed.Server == nil {
-		return nil
-	}
-	server := parsed.Server
-
-	proxy := map[string]any{
-		"name":        subReq.endpointRemark(inbound, client.Email, ep, ""),
-		"type":        "wireguard",
-		"server":      inbound.Listen,
-		"port":        inbound.Port,
-		"udp":         true,
-		"private-key": client.PrivateKey,
-	}
-
-	if server.PublicKey != "" {
-		proxy["public-key"] = server.PublicKey
-	}
-	if client.PreSharedKey != "" {
-		proxy["pre-shared-key"] = client.PreSharedKey
-	}
-	if ka := client.KeepAliveSeconds(); ka > 0 {
-		proxy["persistent-keepalive"] = ka
-	}
-
-	for _, addr := range amneziaWGClientAddresses(parsed.Clients, client) {
-		ip := stripCIDR(addr)
-		if ip == "" {
-			continue
-		}
-		if strings.Contains(ip, ":") {
-			proxy["ipv6"] = ip
-		} else {
-			proxy["ip"] = ip
-		}
-	}
-
-	// Always emitted: mihomo's own 1408 default sits above the interface
-	// amneziawgnet actually runs once s4 passes 12, so the tunnel fragments.
-	proxy["mtu"] = amneziawg.EffectiveMTU(server.MTU, server.S4)
-
-	var dns []string
-	if server.PrimaryDNS != "" {
-		dns = append(dns, server.PrimaryDNS)
-	}
-	if server.SecondaryDNS != "" {
-		dns = append(dns, server.SecondaryDNS)
-	}
-	if len(dns) > 0 {
-		proxy["dns"] = dns
-		// mihomo ignores dns without this flag, but aborts the whole config on
-		// a value its dns.ParseNameServer rejects, so only bare IPs opt in.
-		if allBareIPs(dns) {
-			proxy["remote-dns-resolve"] = true
-		}
-	}
-
-	awg := map[string]any{}
-	if server.Jc != 0 {
-		awg["jc"] = server.Jc
-	}
-	if server.Jmin != 0 {
-		awg["jmin"] = server.Jmin
-	}
-	if server.Jmax != 0 {
-		awg["jmax"] = server.Jmax
-	}
-	if server.S1 != 0 {
-		awg["s1"] = server.S1
-	}
-	if server.S2 != 0 {
-		awg["s2"] = server.S2
-	}
-	if server.S3 != 0 {
-		awg["s3"] = server.S3
-	}
-	if server.S4 != 0 {
-		awg["s4"] = server.S4
-	}
-	if server.H1 != "" {
-		awg["h1"] = server.H1
-	}
-	if server.H2 != "" {
-		awg["h2"] = server.H2
-	}
-	if server.H3 != "" {
-		awg["h3"] = server.H3
-	}
-	if server.H4 != "" {
-		awg["h4"] = server.H4
-	}
-	for i, v := range []string{server.I1, server.I2, server.I3, server.I4, server.I5} {
-		if v != "" {
-			awg[fmt.Sprintf("i%d", i+1)] = v
-		}
-	}
-
-	needsV3 := false
-	if server.HeaderProtectionKey != "" {
-		awg["header-protection-key"] = server.HeaderProtectionKey
-		needsV3 = true
-	}
-	if server.ContentPaddingAddition != "" {
-		awg["content-padding-addition"] = server.ContentPaddingAddition
-		needsV3 = true
-	}
-	if server.RekeyAfterTime != "" {
-		awg["rekey-after-time"] = server.RekeyAfterTime
-		needsV3 = true
-	}
-	if server.RekeyTimeout != "" {
-		awg["rekey-timeout"] = server.RekeyTimeout
-		needsV3 = true
-	}
-	if server.RejectAfterTime != "" {
-		awg["reject-after-time"] = server.RejectAfterTime
-		needsV3 = true
-	}
-	if server.KeepaliveTimeout != "" {
-		awg["keepalive-timeout"] = server.KeepaliveTimeout
-		needsV3 = true
-	}
-	if server.MaxHandshakeAttempts != "" {
-		awg["max-handshake-attempts"] = server.MaxHandshakeAttempts
-		needsV3 = true
-	}
-	if server.RandomTrailers {
-		awg["random-trailers"] = true
-		needsV3 = true
-	}
-	if server.DisableCookies {
-		awg["disable-cookies"] = true
-		needsV3 = true
-	}
-	if needsV3 {
-		awg["version"] = 3
-	}
-
-	if len(awg) > 0 {
-		proxy["amnezia-wg-option"] = awg
-	}
-
-	return proxy
-}
-
-// buildXhttpClashOpts converts xhttpSettings from 3x-ui's camelCase JSON
-// storage into the kebab-case map that Mihomo expects under xhttp-opts.
-//
-// Only client-relevant fields are included (allowlist approach).
-// Server-only fields (noSSEHeader, scMaxBufferedPosts, scStreamUpServerSecs,
-// serverMaxHeaderBytes) are automatically excluded because they are not in
-// the mapping. This is intentional — when Mihomo adds new fields, the mapping
-// must be updated explicitly rather than leaking unverified fields to clients.
-//
-// Returns nil if no non-trivial fields are present.
-func buildXhttpClashOpts(xhttp map[string]any) map[string]any {
-	if xhttp == nil {
-		return nil
-	}
-	opts := map[string]any{}
-
-	// Direct fields: path, mode
-	if v, ok := xhttp["path"].(string); ok && v != "" {
-		opts["path"] = v
-	}
-	if v, ok := xhttp["mode"].(string); ok && v != "" {
-		opts["mode"] = v
-	}
-
-	// Host: explicit host field wins, then fall back to headers.Host
-	host := ""
-	if v, ok := xhttp["host"].(string); ok && v != "" {
-		host = v
-	} else if headers, ok := xhttp["headers"].(map[string]any); ok {
-		host = searchHost(headers)
-	}
-	if host != "" {
-		opts["host"] = host
-	}
-
-	type xhttpStringField struct{ src, dst, skipValue string }
-
-	stringFields := []xhttpStringField{
-		{"xPaddingBytes", "x-padding-bytes", ""},
-		{"uplinkHTTPMethod", "uplink-http-method", ""},
-		{"sessionIDPlacement", "session-id-placement", ""},
-		{"sessionIDKey", "session-id-key", ""},
-		{"sessionIDTable", "session-id-table", ""},
-		{"sessionIDLength", "session-id-length", ""},
-		{"seqPlacement", "seq-placement", ""},
-		{"seqKey", "seq-key", ""},
-		{"uplinkDataPlacement", "uplink-data-placement", ""},
-		{"uplinkDataKey", "uplink-data-key", ""},
-		{"scMaxEachPostBytes", "sc-max-each-post-bytes", "1000000"},
-		{"scMinPostsIntervalMs", "sc-min-posts-interval-ms", "30"},
-	}
-
-	for _, f := range stringFields {
-		if v, ok := xhttp[f.src].(string); ok && v != "" && (f.skipValue == "" || v != f.skipValue) {
-			opts[f.dst] = v
-		}
-	}
-
-	// Legacy inbounds (pre xray-core #6258) stored sessionPlacement/sessionKey.
-	// Fall back to them so not-yet-resaved configs still map. Mirrors the
+		retu…2511 tokens truncated…rs the
 	// frontend migration.
 	for _, f := range []xhttpStringField{
 		{"sessionPlacement", "session-id-placement", ""},
@@ -1009,8 +713,15 @@ func buildXhttpClashOpts(xhttp map[string]any) map[string]any {
 			{"hMaxRequestTimes", "h-max-request-times"},
 			{"hMaxReusableSecs", "h-max-reusable-secs"},
 		} {
-			if v, ok := xmux[f.src].(string); ok && v != "" {
-				reuse[f.dst] = v
+			v, ok := nonZeroShareValue(xmux[f.src])
+			if !ok {
+				continue
+			}
+			if n, isFloat := v.(float64); isFloat {
+				// JSON numbers decode as float64, and %v would render 1000000 as "1e+06".
+				reuse[f.dst] = strconv.FormatFloat(n, 'f', -1, 64)
+			} else {
+				reuse[f.dst] = fmt.Sprint(v)
 			}
 		}
 		if v, ok := nonZeroShareValue(xmux["hKeepAlivePeriod"]); ok {
@@ -1051,6 +762,19 @@ func (s *SubClashService) applyTransport(proxy map[string]any, network string, s
 			if header != nil {
 				typeStr, _ := header["type"].(string)
 				if typeStr != "" && typeStr != "none" {
+					// Mihomo's simple-obfs always sends GET /, and xray-core rejects a request whose
+					// path is not one of the header's paths, so only a "/" header maps to obfs.
+					if proxy["type"] == "ss" && typeStr == "http" && tcpHeaderAcceptsRootPath(header) {
+						proxy["plugin"] = "obfs"
+						opts := map[string]any{
+							"mode": "http",
+						}
+						if host := extractTCPHeaderHost(header); host != "" {
+							opts["host"] = host
+						}
+						proxy["plugin-opts"] = opts
+						return true
+					}
 					return false
 				}
 			}
@@ -1124,6 +848,50 @@ func (s *SubClashService) applyTransport(proxy map[string]any, network string, s
 	default:
 		return false
 	}
+}
+
+// tcpHeaderAcceptsRootPath reports whether the inbound's HTTP header accepts "/"; xray-core
+// defaults an absent request path to "/".
+func tcpHeaderAcceptsRootPath(header map[string]any) bool {
+	request, _ := header["request"].(map[string]any)
+	paths, _ := request["path"].([]any)
+	if len(paths) == 0 {
+		return true
+	}
+	for _, p := range paths {
+		if p == "/" {
+			return true
+		}
+	}
+	return false
+}
+
+func extractTCPHeaderHost(header map[string]any) string {
+	request, _ := header["request"].(map[string]any)
+	reqHeaders, _ := request["headers"].(map[string]any)
+	return findHostInHeaders(reqHeaders)
+}
+
+func findHostInHeaders(headers map[string]any) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, "host") {
+			switch val := v.(type) {
+			case string:
+				return strings.TrimSpace(val)
+			case []string:
+				if len(val) > 0 {
+					return strings.TrimSpace(val[0])
+				}
+			case []any:
+				if len(val) > 0 {
+					if h, ok := val[0].(string); ok {
+						return strings.TrimSpace(h)
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (s *SubClashService) applySecurity(proxy map[string]any, security string, stream map[string]any) bool {
@@ -1288,16 +1056,50 @@ func mergeClashRulesYAML(base map[string]any, raw string) error {
 	return nil
 }
 
-// mergeRemoteClashRules lets remote update only the route graph (see
-// remoteClashAllowedKey) and never mutates remote: cached documents are shared.
-func mergeRemoteClashRules(base map[string]any, remote map[string]any) error {
+type remoteClashKeyClass int
+
+const (
+	remoteClashRouteGraph remoteClashKeyClass = iota + 1
+	remoteClashClientConfig
+)
+
+// Client config keys steer the client's own resolver, so a remote URL may set
+// them only when the admin opts in (subClashRemoteDNS).
+var remoteClashKeyClasses = map[string]remoteClashKeyClass{
+	"proxy-groups":   remoteClashRouteGraph,
+	"rule-providers": remoteClashRouteGraph,
+	"rules":          remoteClashRouteGraph,
+	"dns":            remoteClashClientConfig,
+	"sniffer":        remoteClashClientConfig,
+}
+
+func remoteClashKeyAllowed(key string, allowClientConfig bool) bool {
+	switch remoteClashKeyClasses[key] {
+	case remoteClashRouteGraph:
+		return true
+	case remoteClashClientConfig:
+		return allowClientConfig
+	default:
+		return false
+	}
+}
+
+// mergeRemoteClashRules copies only keys listed in remoteClashKeyClasses and
+// never mutates remote: cached documents are shared.
+func mergeRemoteClashRules(base map[string]any, remote map[string]any, allowClientConfig bool) error {
 	if len(remote) == 0 {
 		return fmt.Errorf("remote Clash routing source must be a YAML map")
 	}
 
 	for key, value := range remote {
-		if !remoteClashAllowedKey(key) {
+		if !remoteClashKeyAllowed(key, allowClientConfig) {
 			continue
+		}
+		if remoteClashKeyClasses[key] == remoteClashClientConfig {
+			// A malformed dns or sniffer must not cost the client its routing.
+			if _, ok := value.(map[string]any); !ok {
+				continue
+			}
 		}
 		if err := validateRemoteClashValue(key, value); err != nil {
 			return err
@@ -1372,15 +1174,6 @@ func validateRemoteClashValue(key string, value any) error {
 		}
 	}
 	return nil
-}
-
-func remoteClashAllowedKey(key string) bool {
-	switch key {
-	case "proxy-groups", "rule-providers", "rules":
-		return true
-	default:
-		return false
-	}
 }
 
 func validateClashRouteGraph(config map[string]any) error {
@@ -1592,3 +1385,4 @@ func linesToClashRules(raw string) []any {
 	}
 	return rules
 }
+

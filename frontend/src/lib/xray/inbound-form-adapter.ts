@@ -8,6 +8,7 @@ import type { InboundSettings } from '@/schemas/protocols/inbound';
 import {
   AmneziawgClientSchema,
   HysteriaClientSchema,
+  MasqueClientSchema,
   MtprotoClientSchema,
   ShadowsocksClientSchema,
   TrojanClientSchema,
@@ -27,6 +28,7 @@ import { canEnableSniffing } from '@/lib/xray/protocol-capabilities';
 import { tlsCertUsesFiles } from '@/schemas/protocols/security/tls';
 import { SockoptStreamSettingsSchema } from '@/schemas/protocols/stream/sockopt';
 import { XHttpStreamSettingsSchema, XHttpXmuxSchema } from '@/schemas/protocols/stream/xhttp';
+import { liftLegacyXDriveService } from '@/schemas/protocols/stream/xdrive';
 
 const XMUX_DEFAULTS = XHttpXmuxSchema.parse({});
 
@@ -139,6 +141,8 @@ const NETWORK_SETTINGS_KEY: Record<string, string> = {
   httpupgrade: 'httpupgradeSettings',
   xhttp: 'xhttpSettings',
   hysteria: 'hysteriaSettings',
+  xdrive: 'xdriveSettings',
+  masque: 'masqueSettings',
 };
 
 function healStreamNetworkKey(stream: Record<string, unknown>): void {
@@ -180,6 +184,7 @@ export function rawInboundToFormValues(row: RawInboundRow): InboundFormValues {
     Object.keys(rawStream).length > 0 ? (rawStream as StreamSettings) : undefined;
   if (streamSettings) {
     healStreamNetworkKey(streamSettings as unknown as Record<string, unknown>);
+    liftLegacyXDriveService(streamSettings as unknown as Record<string, unknown>);
     synthesizeTlsCertUseFile(streamSettings as unknown as Record<string, unknown>);
     const streamRecord = streamSettings as unknown as Record<string, unknown>;
     const xh = streamRecord.xhttpSettings;
@@ -288,6 +293,8 @@ function clientSchemaForProtocol(protocol: string): z.ZodType | null {
       return AmneziawgClientSchema;
     case 'tuic':
       return TuicClientSchema;
+    case 'masque':
+      return MasqueClientSchema;
     default:
       return null;
   }

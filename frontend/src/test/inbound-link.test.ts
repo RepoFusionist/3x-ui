@@ -16,11 +16,13 @@ import {
   genVmessLink,
   genWireguardConfig,
   genWireguardLink,
+  isPostQuantumLink,
   preferPublicHost,
   resolveAddr,
 } from '@/lib/xray/inbound-link';
 import { type DbInboundLike, inboundFromDb } from '@/lib/xray/inbound-from-db';
 import { InboundSchema } from '@/schemas/api/inbound';
+import { Base64 } from '@/utils';
 import type { AmneziawgInboundSettings } from '@/schemas/protocols/inbound/amneziawg';
 import type { WireguardInboundSettings } from '@/schemas/protocols/inbound/wireguard';
 import type { FinalMaskStreamSettings } from '@/schemas/protocols/stream/finalmask';
@@ -124,6 +126,28 @@ describe('genVlessLink', () => {
       expect(link).toMatchSnapshot();
     });
   }
+});
+
+describe('XDRIVE share links', () => {
+  // No client reads an xdrive link, and one carrying the storage secrets would print
+  // them into every QR code; mirrors the Go generator, which emits none either.
+  it('emits no link for an XDRIVE stream', () => {
+    const [, raw] = fixturesForProtocol('vless').find(([name]) => name === 'vless-ws-tls')!;
+    const inbound = InboundSchema.parse({
+      ...raw,
+      streamSettings: {
+        network: 'xdrive',
+        security: 'none',
+        xdriveSettings: { service: 'local', remoteFolder: '/srv/xdrive' },
+      },
+    });
+    const client = (raw as { settings: { clients: Array<{ id: string; email: string }> } }).settings
+      .clients[0];
+
+    const entries = genAllLinks({ inbound, client, fallbackHostname: 'panel.example.test' });
+
+    expect(entries.map((e) => e.link)).toEqual(['']);
+  });
 });
 
 describe('applyVlessRoute', () => {
@@ -263,6 +287,22 @@ describe('genVlessLink TCP fragment finalmask compatibility', () => {
     const exported = finalmaskFrom(linkFor(finalmask));
 
     expect(exported).toEqual(finalmask);
+  });
+
+  // xray-core 26.10.21's filter screens the listener's own source IPs; a client core older than
+  // it refuses the unknown type, and the lists would hand clients the server's IP policy.
+  it('leaves the inbound-only filter mask out of the link', () => {
+    const exported = finalmaskFrom(
+      linkFor({
+        tcp: [{ type: 'filter', settings: { allowedSourceIPs: ['10.0.0.0/8'] } }],
+        udp: [
+          { type: 'filter', settings: { blockedSourceIPs: ['geoip:cn'] } },
+          { type: 'salamander', settings: { password: 'p' } },
+        ],
+      }),
+    );
+
+    expect(exported).toEqual({ udp: [{ type: 'salamander', settings: { password: 'p' } }] });
   });
 
   it('exports a stored UDP-only finalmask whose empty tcp list was dropped on save', () => {
@@ -1413,5 +1453,148 @@ describe('genTuicLink', () => {
     expect(link).toContain('allow_insecure=1');
     expect(link).toContain('#TUIC-Node-US');
     expect(link).not.toContain('#TUIC-Node-US-US');
+  });
+});
+
+describe('isPostQuantumLink', () => {
+  type RealityFixture = {
+    settings: { clients: Array<{ id: string }>; encryption?: string };
+    streamSettings: { realitySettings: { settings: { mldsa65Verify?: string } } };
+  };
+  const [, raw] = fixturesForProtocol('vless').find(([name]) => name === 'vless-tcp-reality')!;
+  const clientId = (raw as RealityFixture).settings.clients[0].id;
+  const x25519Key = 'G3cdPSd1-NnlpTbWNSM5vHsT5VNzWfFzYSKwbUMnV1Y';
+  const mlkem768Key = 'A'.repeat(1579);
+
+  function realityLink(edit: (inbound: RealityFixture) => void = () => {}): string {
+    const copy = structuredClone(raw) as RealityFixture;
+    edit(copy);
+    return genVlessLink({ inbound: InboundSchema.parse(copy), address: 'example.test', clientId });
+  }
+
+  // #6730: the REALITY ML-KEM support hint is a short flag, not a large PQ payload.
+  it('keeps the QR for a plain REALITY link', () => {
+    expect(isPostQuantumLink(realityLink())).toBe(false);
+  });
+
+  it('keeps the QR for VLESS encryption authenticated by an X25519 key', () => {
+    const link = realityLink((ib) => {
+      ib.settings.encryption = `mlkem768x25519plus.native.0rtt.${x25519Key}`;
+    });
+    expect(isPostQuantumLink(link)).toBe(false);
+  });
+
+  it('hides the QR for VLESS encryption authenticated by an ML-KEM-768 key', () => {
+    const link = realityLink((ib) => {
+      ib.settings.encryption = `mlkem768x25519plus.native.0rtt.${mlkem768Key}`;
+    });
+    expect(isPostQuantumLink(link)).toBe(true);
+  });
+
+  it('hides the QR for a REALITY link carrying an ML-DSA-65 verify key', () => {
+    const link = realityLink((ib) => {
+      ib.streamSettings.realitySettings.settings.mldsa65Verify = 'B'.repeat(2603);
+    });
+    expect(isPostQuantumLink(link)).toBe(true);
+  });
+
+  it('exports cipherSuites as cs query parameter on VLESS TLS links', () => {
+    const [, rawFixture] = fixturesForProtocol('vless')[0];
+    const stream = rawFixture.streamSettings as Record<string, unknown> | undefined;
+    const tls = stream?.tlsSettings as Record<string, unknown> | undefined;
+    const typed = InboundSchema.parse({
+      ...rawFixture,
+      streamSettings: {
+        ...stream,
+        security: 'tls',
+        tlsSettings: {
+          ...tls,
+          cipherSuites: 'TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256',
+        },
+      },
+    });
+
+    const link = genVlessLink({
+      inbound: typed,
+      address: 'example.test',
+      port: 443,
+      clientId: '11111111-2222-3333-4444-555555555555',
+    });
+    expect(new URL(link).searchParams.get('cs')).toBe(
+      'TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256',
+    );
+  });
+
+  // Xray reads an empty fingerprint as chrome, whose uTLS hello drops cipherSuites,
+  // so a link carrying cs with no fingerprint must ask for unsafe.
+  describe('cipherSuites pin fp=unsafe when no fingerprint is set', () => {
+    function tlsInbound(
+      protocol: 'vless' | 'vmess' | 'trojan',
+      fingerprint: string,
+      cipherSuites = 'TLS_AES_128_GCM_SHA256',
+    ) {
+      const [, rawFixture] = fixturesForProtocol(protocol)[0];
+      const stream = rawFixture.streamSettings as Record<string, unknown> | undefined;
+      const tls = (stream?.tlsSettings ?? {}) as Record<string, unknown>;
+      return InboundSchema.parse({
+        ...rawFixture,
+        streamSettings: {
+          ...stream,
+          security: 'tls',
+          tlsSettings: {
+            ...tls,
+            cipherSuites,
+            settings: { ...(tls.settings as Record<string, unknown>), fingerprint },
+          },
+        },
+      });
+    }
+
+    it('VLESS link gets fp=unsafe', () => {
+      const link = genVlessLink({
+        inbound: tlsInbound('vless', ''),
+        address: 'example.test',
+        clientId: '11111111-2222-3333-4444-555555555555',
+      });
+      expect(new URL(link).searchParams.get('fp')).toBe('unsafe');
+    });
+
+    it('VLESS link keeps an explicit fingerprint', () => {
+      const link = genVlessLink({
+        inbound: tlsInbound('vless', 'firefox'),
+        address: 'example.test',
+        clientId: '11111111-2222-3333-4444-555555555555',
+      });
+      expect(new URL(link).searchParams.get('fp')).toBe('firefox');
+    });
+
+    it('VMess link gets fp=unsafe', () => {
+      const link = genVmessLink({
+        inbound: tlsInbound('vmess', ''),
+        address: 'example.test',
+        clientId: '11111111-2222-3333-4444-555555555555',
+      });
+      const obj = JSON.parse(Base64.decode(link.slice('vmess://'.length))) as Record<
+        string,
+        unknown
+      >;
+      expect(obj.fp).toBe('unsafe');
+    });
+
+    it('Trojan link gets fp=unsafe from an external proxy cipherSuites', () => {
+      const link = genTrojanLink({
+        inbound: tlsInbound('trojan', '', ''),
+        address: 'example.test',
+        clientPassword: 'pw',
+        externalProxy: {
+          forceTls: 'same',
+          dest: 'cdn.example.test',
+          port: 443,
+          remark: '',
+          cipherSuites: 'TLS_AES_256_GCM_SHA384',
+        },
+      });
+      expect(new URL(link).searchParams.get('fp')).toBe('unsafe');
+    });
   });
 });

@@ -93,6 +93,31 @@ export function buildWarpOutbound(
   };
 }
 
+interface WarpMasqueRegistration {
+  privateKey: string;
+  publicKey: string;
+  address: string[];
+  endpoint: string;
+}
+
+// Cloudflare serves WARP over MASQUE on HTTP/3 behind this SNI; the enrolled key and
+// endpoint key replace user/pass, which xray-core refuses next to a warp block.
+export function buildWarpMasqueOutbound(reg: WarpMasqueRegistration): Record<string, unknown> {
+  return {
+    tag: 'warp-masque',
+    protocol: 'masque',
+    settings: { address: reg.endpoint, port: 443 },
+    streamSettings: {
+      network: 'masque',
+      security: 'tls',
+      tlsSettings: { serverName: 'consumer-masque.cloudflareclient.com', alpn: ['h3'] },
+      masqueSettings: {
+        warp: { privateKey: reg.privateKey, publicKey: reg.publicKey, address: reg.address },
+      },
+    },
+  };
+}
+
 export function mergeWarpRotation(
   existing: Record<string, unknown> | undefined,
   data: WarpData | null,
@@ -310,6 +335,21 @@ export default function WarpModal({
     }
   }
 
+  async function addMasqueOutbound() {
+    setLoading(true);
+    try {
+      const msg = await HttpUtil.post<string>('/panel/api/xray/warp/regMasque');
+      if (!msg?.success || !msg.obj) return;
+      const outbound = buildWarpMasqueOutbound(JSON.parse(msg.obj) as WarpMasqueRegistration);
+      const index = templateSettings?.outbounds?.findIndex((o) => o?.tag === 'warp-masque') ?? -1;
+      if (index >= 0) onResetOutbound({ index, outbound });
+      else onAddOutbound(outbound);
+      onClose();
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function addOutbound() {
     if (!stagedOutbound) {
       messageApi.warning(t('pages.xray.warp.fetchFirst'));
@@ -333,7 +373,12 @@ export default function WarpModal({
       <Modal open={open} title="Cloudflare WARP" footer={null} onCancel={onClose}>
         <FormProvider {...methods}>
           {!hasWarp ? (
-            <Button type="primary" loading={loading} icon={<ApiOutlined />} onClick={register}>
+            <Button
+              type="primary"
+              loading={loading}
+              icon={<ApiOutlined aria-hidden />}
+              onClick={register}
+            >
               {t('pages.xray.warp.createAccount')}
             </Button>
           ) : (
@@ -364,7 +409,7 @@ export default function WarpModal({
                 type="primary"
                 danger
                 className="mt-8"
-                icon={<DeleteOutlined />}
+                icon={<DeleteOutlined aria-hidden />}
                 onClick={delConfig}
               >
                 {t('pages.xray.warp.deleteAccount')}
@@ -451,7 +496,7 @@ export default function WarpModal({
                 <Button
                   loading={loading}
                   type="primary"
-                  icon={<SyncOutlined />}
+                  icon={<SyncOutlined aria-hidden />}
                   onClick={getConfig}
                 >
                   {t('refresh')}
@@ -460,7 +505,7 @@ export default function WarpModal({
                   loading={loading}
                   type="primary"
                   className="ml-8"
-                  icon={<SyncOutlined />}
+                  icon={<SyncOutlined aria-hidden />}
                   onClick={changeIp}
                 >
                   {t('pages.xray.warp.changeIp', 'Change IP')}
@@ -533,7 +578,7 @@ export default function WarpModal({
                         type="primary"
                         loading={loading}
                         className="ml-8"
-                        icon={<PlusOutlined />}
+                        icon={<PlusOutlined aria-hidden />}
                         onClick={addOutbound}
                       >
                         {t('pages.xray.warp.addOutbound')}
@@ -544,6 +589,18 @@ export default function WarpModal({
               )}
             </>
           )}
+
+          <Divider className="my-10">MASQUE</Divider>
+          <Alert type="info" showIcon title={t('pages.xray.warp.masqueDesc')} />
+          <Button
+            type="primary"
+            className="mt-8"
+            loading={loading}
+            icon={<PlusOutlined aria-hidden />}
+            onClick={addMasqueOutbound}
+          >
+            {t('pages.xray.warp.addMasqueOutbound')}
+          </Button>
         </FormProvider>
       </Modal>
     </>

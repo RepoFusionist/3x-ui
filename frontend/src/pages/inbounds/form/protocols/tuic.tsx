@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AutoComplete,
@@ -21,6 +21,8 @@ import { HttpUtil } from '@/utils';
 
 export default function TuicFields() {
   const { t } = useTranslation();
+  const uid = useId();
+  const [messageApi, messageContextHolder] = message.useMessage();
   const { control, setValue } = useFormContext();
   const [loadingPanelCert, setLoadingPanelCert] = useState(false);
 
@@ -36,7 +38,7 @@ export default function TuicFields() {
   const autofillFromSni = () => {
     const cleanSni = (sni || '').trim();
     if (!cleanSni) {
-      message.warning(t('pages.xray.tuic.sniRequired'));
+      messageApi.warning(t('pages.xray.tuic.sniRequired'));
       return;
     }
     setValue('settings.server.certificate', `/root/cert/${cleanSni}/fullchain.pem`);
@@ -51,12 +53,12 @@ export default function TuicFields() {
           ? await HttpUtil.get(`/panel/api/nodes/webCert/${nodeId}`, undefined, { silent: true })
           : await HttpUtil.post('/panel/api/setting/all', undefined, { silent: true });
       if (!msg?.success) {
-        message.warning(msg?.msg || t('pages.inbounds.setDefaultCertEmpty'));
+        messageApi.warning(msg?.msg || t('pages.inbounds.setDefaultCertEmpty'));
         return;
       }
       const obj = msg.obj as { webCertFile?: string; webKeyFile?: string };
       if (!obj?.webCertFile && !obj?.webKeyFile) {
-        message.warning(t('pages.inbounds.setDefaultCertEmpty'));
+        messageApi.warning(t('pages.inbounds.setDefaultCertEmpty'));
         return;
       }
       if (obj.webCertFile) {
@@ -65,9 +67,9 @@ export default function TuicFields() {
       if (obj.webKeyFile) {
         setValue('settings.server.private_key', obj.webKeyFile);
       }
-      message.success(t('pages.inbounds.setSuccess'));
+      messageApi.success(t('pages.inbounds.setSuccess'));
     } catch {
-      message.error(t('somethingWentWrong'));
+      messageApi.error(t('somethingWentWrong'));
     } finally {
       setLoadingPanelCert(false);
     }
@@ -145,8 +147,10 @@ export default function TuicFields() {
 
   return (
     <>
-      <Form.Item label={t('pages.inbounds.publicKey')}>
+      {messageContextHolder}
+      <Form.Item htmlFor={`${uid}-certificate`} label={t('pages.inbounds.publicKey')}>
         <AutoComplete
+          id={`${uid}-certificate`}
           value={certificate}
           options={certOptions}
           onChange={(v) => setValue('settings.server.certificate', v)}
@@ -154,8 +158,9 @@ export default function TuicFields() {
         />
       </Form.Item>
 
-      <Form.Item label={t('pages.inbounds.privatekey')}>
+      <Form.Item htmlFor={`${uid}-privateKey`} label={t('pages.inbounds.privatekey')}>
         <AutoComplete
+          id={`${uid}-privateKey`}
           value={privateKey}
           options={keyOptions}
           onChange={(v) => setValue('settings.server.private_key', v)}
@@ -164,16 +169,16 @@ export default function TuicFields() {
       </Form.Item>
 
       <Form.Item label=" ">
-        <Space>
+        <Space wrap style={{ display: 'flex', flexWrap: 'wrap', width: '100%' }}>
           <Button
             type="primary"
-            icon={<CloudDownloadOutlined />}
+            icon={<CloudDownloadOutlined aria-hidden />}
             loading={loadingPanelCert}
             onClick={setCertFromPanel}
           >
             {t('pages.inbounds.setDefaultCert')}
           </Button>
-          <Button icon={<SyncOutlined />} onClick={autofillFromSni}>
+          <Button icon={<SyncOutlined aria-hidden />} onClick={autofillFromSni}>
             {t('pages.inbounds.form.autoFill')}
           </Button>
           <Button
@@ -215,12 +220,21 @@ export default function TuicFields() {
 
       <Divider titlePlacement="start">{t('pages.xray.tuic.profileOptions')}</Divider>
 
-      <Form.Item label={t('pages.xray.tuic.sni')} tooltip={t('pages.xray.tuic.sniHint')}>
+      <Form.Item
+        htmlFor={`${uid}-sni`}
+        label={t('pages.xray.tuic.sni')}
+        tooltip={t('pages.xray.tuic.sniHint')}
+      >
         <Input
+          id={`${uid}-sni`}
+          aria-describedby={`${uid}-sni-hint`}
           value={sni}
           placeholder="example.com"
           onChange={(e) => handleSniChange(e.target.value)}
         />
+        <span id={`${uid}-sni-hint`} hidden>
+          {t('pages.xray.tuic.sniHint')}
+        </span>
       </Form.Item>
 
       <FormField
