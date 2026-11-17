@@ -45,8 +45,33 @@ def validate_public_dns(source_url):
         raise ValueError('non-public upstream address')
 
 
+def prepare_share_subscription(body):
+    text = body.decode('utf-8-sig').strip() if isinstance(body, bytes) else str(body).strip()
+    if '://' not in text:
+        compact = ''.join(text.split())
+        text = base64.b64decode(compact + '=' * (-len(compact) % 4),
+                                altchars=b'-_', validate=True).decode('utf-8-sig')
+    links = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if not urllib.parse.urlsplit(line).scheme or '://' not in line:
+            raise ValueError('unsupported share link')
+        if line not in links:
+            links.append(line)
+    if not links or len(links) > 512:
+        raise ValueError('invalid share subscription size')
+    return {'proxies': [{'link': link} for link in links],
+            'group': {'name': AUTO_GROUP, 'type': 'url-test', 'hidden': False,
+                      'use': [ENTRY_PROVIDER], 'url': 'https://www.gstatic.com/generate_204',
+                      'interval': 300}}
+
+
 def prepare_upstream(document, automatic_name='自动选择'):
     """Keep the provider's automatic group and only its concrete dependencies."""
+    if isinstance(document, (bytes, str)):
+        return prepare_share_subscription(document)
     if not isinstance(document, dict):
         raise ValueError('expected Clash mapping')
     groups = document.get('proxy-groups', [])
@@ -174,8 +199,15 @@ class ChainCache:
                 body = response.read(MAX_BYTES + 1)
             if len(body) > MAX_BYTES:
                 raise ValueError('upstream body limit')
-            prepared = prepare_upstream(yaml.safe_load(body),
-                                        self.config['chain'].get('automatic_group', '自动选择'))
+            try:
+                document = yaml.safe_load(body)
+            except yaml.YAMLError:
+                document = None
+            if isinstance(document, dict):
+                prepared = prepare_upstream(document,
+                                            self.config['chain'].get('automatic_group', '自动选择'))
+            else:
+                prepared = prepare_upstream(body)
             generate(prepared, self.config['chain']['exit'])
             entry = {'prepared': prepared, 'fetched_at': time.time()}
             temp = cache_path.with_suffix('.tmp')
@@ -223,4 +255,5 @@ class ChainCache:
         while True:
             self.refresh()
             time.sleep(max(30, self.config['refresh_seconds']))
+
 
