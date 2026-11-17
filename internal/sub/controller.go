@@ -347,6 +347,8 @@ func (a *SUBController) initRouter(g *gin.RouterGroup) {
 	gLink := g.Group(a.subPath, setNoCacheHeaders)
 	gLink.GET(":subid", a.subs)
 	gLink.HEAD(":subid", a.subs)
+	gLink.GET(":subid/spare/*source", a.spareClash)
+	gLink.HEAD(":subid/spare/*source", a.spareClash)
 	gLink.GET(":subid/hwid-status", a.hwidStatus)
 	gLink.HEAD(":subid/hwid-status", a.hwidStatus)
 	if a.jsonEnabled {
@@ -358,6 +360,8 @@ func (a *SUBController) initRouter(g *gin.RouterGroup) {
 		gClash := g.Group(a.subClashPath, setNoCacheHeaders)
 		gClash.GET(":subid", a.subClashs)
 		gClash.HEAD(":subid", a.subClashs)
+		gClash.GET(":subid/spare/*source", a.spareClash)
+		gClash.HEAD(":subid/spare/*source", a.spareClash)
 		if sameSubscriptionPath(a.subClashPath, subMihomoPath) {
 			// The configured Clash path already provides the full Mihomo profile.
 		} else if owner := a.configuredSubscriptionPathOwner(subMihomoPath); owner != "" {
@@ -366,6 +370,8 @@ func (a *SUBController) initRouter(g *gin.RouterGroup) {
 			gMihomo := g.Group(subMihomoPath, setNoCacheHeaders)
 			gMihomo.GET(":subid", a.subClashs)
 			gMihomo.HEAD(":subid", a.subClashs)
+			gMihomo.GET(":subid/spare/*source", a.spareClash)
+			gMihomo.HEAD(":subid/spare/*source", a.spareClash)
 		}
 		if owner := a.configuredSubscriptionPathOwner(subClashLegacyPath); owner != "" {
 			logger.Warningf("Legacy Clash subscription alias %q is unavailable because it conflicts with the configured %s path", subClashLegacyPath, owner)
@@ -870,6 +876,24 @@ func (a *SUBController) subClashs(c *gin.Context) {
 	a.subClash(c, false)
 }
 
+// spareClash adds an upstream subscription to this request only. It does not
+// mutate the client's saved external subscriptions or reveal the source URL.
+func (a *SUBController) spareClash(c *gin.Context) {
+	source, ok := spareSourceFromRequest(c.Request)
+	if !ok {
+		c.String(http.StatusBadRequest, "Invalid backup subscription URL")
+		return
+	}
+	if !a.enforceHwid(c) {
+		return
+	}
+	c.Set("spareSubscriptionSource", source)
+	if !a.serveClashBody(c, false, false) {
+		writeSubError(c, nil)
+	}
+	a.recordSubscriptionFetch(c)
+}
+
 func (a *SUBController) subClashLegacy(c *gin.Context) {
 	a.subClash(c, true)
 }
@@ -904,6 +928,8 @@ func (a *SUBController) serveClashBody(c *gin.Context, rawDownload bool, legacy 
 	var err error
 	if legacy {
 		clashSub, header, err = a.subClashService.GetClashLegacy(subId, host)
+	} else if source, ok := c.Get("spareSubscriptionSource"); ok {
+		clashSub, header, err = a.subClashService.GetClashWithSpare(subId, host, source.(string))
 	} else {
 		clashSub, header, err = a.subClashService.GetClash(subId, host)
 	}
@@ -1003,3 +1029,4 @@ func (a *SUBController) ApplyCommonHeaders(
 	ApplyHappHeaders(c, a.happConfig, happManaged)
 	ApplyIncyHeaders(c, a.incyConfig, a.incyConfig.AutoDetect && incyClient)
 }
+

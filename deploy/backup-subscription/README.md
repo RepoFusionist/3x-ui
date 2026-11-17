@@ -1,17 +1,8 @@
-# Per-subscription backup node
+# Dynamic spare subscription
 
-This sidecar converts one HTTPS Mihomo subscription into an inline entry provider and one authenticated HTTPS backup exit. It listens only on `127.0.0.1:18082` in the 3x-ui network namespace.
+Append `/spare/` and an HTTPS subscription address to an existing 3x-ui subscription URL. A Mihomo request generates one backup node for the current subscriber without saving a subscription record to the database. The original `自动选择` group contains only the subscriber's original nodes; a hidden automatic group tests the imported entry nodes and is used as the dialer for `备用节点`.
 
-In a client's external subscription URL field, enter the local prefix followed immediately by the upstream subscription URL:
+The current subscriber's user and inbound routing rule determine the LSP endpoint. The generated backup uses its matching verified HTTPS endpoint and credentials from the private sidecar configuration; generation fails if no unique matching route or verified endpoint exists.
 
-```text
-http://127.0.0.1:18082/subscription/https://provider.example/path?token=...
-```
-
-The upstream may return a Mihomo YAML document with an `自动选择` `url-test` group, or a plain/base64 share-link subscription. Plain links are parsed by the same 3x-ui converter used for external subscription nodes (VMess, VLESS, Trojan, Shadowsocks, Hysteria2, and WireGuard); links that the current Mihomo converter cannot represent are skipped. The sidecar creates one `备用线路-美国` HTTPS exit node, and the 3x-ui Mihomo subscription exposes that exit under the client's existing `专线` selection group (or `PROXY` when no `专线` group exists).
-
-Mount `backend.py` and `chain.py` at `/app/backend.py` and `/app/chain.py` in the sidecar. Keep the existing `/config/config.json` chain exit credentials private; they are not part of this source tree. The legacy `/subscription` endpoint continues to use the configured default source.
-
-The source URL is never written to cache files or logs. The sidecar accepts HTTPS sources that resolve only to public IP addresses and checks HTTPS redirects the same way.
-
+The sidecar accepts a Mihomo YAML subscription with an `自动选择` group or a plain/base64 share-link subscription supported by the 3x-ui Mihomo converter. It listens on `127.0.0.1:18082` in the 3x-ui network namespace. Keep `/config/config.json` and the cache private.
 

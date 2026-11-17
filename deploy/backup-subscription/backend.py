@@ -1,6 +1,7 @@
 """Private, fixed-source subscription cache; listen inside 3x-ui's loopback only."""
 import base64
 import collections
+import http.client
 import ipaddress
 import json
 import os
@@ -29,6 +30,28 @@ def validate_https_target(url):
                      socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
     if not addresses or any(not address.is_global for address in addresses):
         raise ValueError('non-public HTTPS target')
+
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        addresses = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise ValueError('non-public HTTPS target')
+        error = None
+        for family, kind, proto, _, address in addresses:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(self.timeout)
+            try:
+                sock.connect(address)
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                return
+            except OSError as exc:
+                error = exc
+                sock.close()
+        raise OSError('HTTPS target unavailable') from error
+
+class PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PublicHTTPSConnection, req, context=self._context)
 
 class HTTPSRedirectOnly(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, message, headers, newurl):
@@ -146,15 +169,16 @@ def make_handler(cache):
                 self.reply(404, b'not found\n')
                 return
             if 'chain' in cache.config:
+                if route == 'health':
+                    self.reply(200, json.dumps({'ready': True, 'format': 'mihomo',
+                                                'dynamic': True}).encode(), 'application/json')
+                    return
                 try:
                     prepared, status = cache.snapshot(source_url)
                 except Exception:
                     self.reply(503, b'no usable chain cache\n')
                     return
-                if route == 'health':
-                    self.reply(200 if status['ready'] else 503,
-                               json.dumps(status, ensure_ascii=False).encode(), 'application/json')
-                elif prepared:
+                if prepared:
                     try:
                         body = cache.document(prepared)
                     except Exception:
@@ -188,14 +212,16 @@ def main():
     config = json.loads(Path('/config/config.json').read_text())
     if 'chain' in config:
         from chain import ChainCache
-        cache = ChainCache(config, '/cache', HTTPSRedirectOnly)
+        cache = ChainCache(config, '/cache', HTTPSRedirectOnly, PublicHTTPSHandler)
     else:
         cache = Cache(config, '/cache')
-    threading.Thread(target=cache.loop, daemon=True).start()
+    if 'chain' not in config:
+        threading.Thread(target=cache.loop, daemon=True).start()
     server = ThreadingHTTPServer(('127.0.0.1', 18082), make_handler(cache))
     server.daemon_threads = True
     server.serve_forever()
 
 if __name__ == '__main__':
     main()
+
 

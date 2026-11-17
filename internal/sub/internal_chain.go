@@ -12,13 +12,15 @@ import (
 	yaml "github.com/goccy/go-yaml"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
 
 const internalChainURLPrefix = "http://127.0.0.1:18082/subscription/"
 const chainEntryProvider = "101中转节点"
 const chainExitProvider = "101出口节点"
 const chainAutoGroup = "101自动"
-const chainExitName = "备用线路-美国"
+const chainExitName = "备用节点"
+const chainBackendExitName = "备用线路-美国"
 
 var internalChainHTTPClient = &http.Client{
 	Timeout:   30 * time.Second,
@@ -94,7 +96,7 @@ func chainPayload(doc map[string]any, name string) ([]any, error) {
 	return payload, nil
 }
 
-func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (map[string]any, error) {
+func mergeInternalChain(base, doc map[string]any, converter *SubClashService, exitRoute spareExitRoute) (map[string]any, error) {
 	entries, err := chainPayload(doc, chainEntryProvider)
 	if err != nil {
 		return nil, err
@@ -104,9 +106,16 @@ func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (m
 		return nil, errors.New("internal chain requires one exit")
 	}
 	exit, _ := exits[0].(map[string]any)
-	if exit["name"] != chainExitName || exit["type"] != "http" || exit["tls"] != true || exit["skip-cert-verify"] != false || exit["dialer-proxy"] != chainAutoGroup {
+	if exit["name"] != chainBackendExitName || exit["type"] != "http" || exit["tls"] != true || exit["skip-cert-verify"] != false || exit["dialer-proxy"] != chainAutoGroup {
 		return nil, errors.New("internal chain requires verified HTTPS")
 	}
+	server, _ := exit["server"].(string)
+	if !strings.EqualFold(server, exitRoute.Server) || exitRoute.Port <= 0 || exitRoute.Port > 65535 {
+		return nil, errors.New("internal chain exit does not match the subscriber's LSP")
+	}
+	exit["name"] = chainExitName
+	exit["port"] = exitRoute.Port
+	exit["sni"] = exitRoute.SNI
 	known := map[string]bool{chainExitName: true, chainAutoGroup: true}
 	converted := make([]any, 0, len(entries))
 	for index, value := range entries {
@@ -148,6 +157,7 @@ func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (m
 	if automatic["type"] != "url-test" || len(use) != 1 || use[0] != chainEntryProvider || automatic["proxies"] != nil {
 		return nil, errors.New("internal chain automatic group rejected")
 	}
+	automatic["hidden"] = true
 	// Clone because subscription routing can cache and share its source maps.
 	encoded, err := marshalClashYAML(base)
 	if err != nil {
@@ -158,11 +168,15 @@ func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (m
 		return nil, errors.New("internal chain clone failed")
 	}
 	native, _ := asAnySlice(result["proxies"])
+	var nativeNames []any
 	for _, value := range native {
 		node, _ := value.(map[string]any)
 		name, _ := node["name"].(string)
 		if known[name] {
 			return nil, errors.New("internal chain name collision")
+		}
+		if name != "" && !isDummyProxy(node) {
+			nativeNames = append(nativeNames, name)
 		}
 	}
 	existing, _ := result["proxy-providers"].(map[string]any)
@@ -175,52 +189,101 @@ func mergeInternalChain(base, doc map[string]any, converter *SubClashService) (m
 	providers, _ := doc["proxy-providers"].(map[string]any)
 	entryProvider, _ := providers[chainEntryProvider].(map[string]any)
 	entryProvider["payload"] = converted
+	entryProvider["health-check"] = map[string]any{"enable": true, "url": "https://www.gstatic.com/generate_204", "interval": 300, "timeout": 5000}
 	existing[chainEntryProvider] = entryProvider
 	existing[chainExitProvider] = providers[chainExitProvider]
 	result["proxy-providers"] = existing
 	ownGroups, _ := asAnySlice(result["proxy-groups"])
-	var target map[string]any
+	var autoTarget map[string]any
+	var selectorTarget map[string]any
 	for _, value := range ownGroups {
 		group, _ := value.(map[string]any)
 		if group["name"] == chainAutoGroup {
 			return nil, errors.New("internal chain group collision")
 		}
+		if group["name"] == "自动选择" {
+			if group["type"] != "url-test" {
+				return nil, errors.New("automatic group name collision")
+			}
+			autoTarget = group
+		}
 		if group["name"] == "专线" {
-			target = group
+			selectorTarget = group
 		}
 	}
-	if target == nil {
+	if selectorTarget == nil {
 		for _, value := range ownGroups {
 			group, _ := value.(map[string]any)
 			if group["name"] == "PROXY" {
-				target = group
+				selectorTarget = group
 				break
 			}
 		}
 	}
-	if target == nil || target["type"] != "select" {
+	if selectorTarget == nil || selectorTarget["type"] != "select" {
 		return nil, errors.New("internal chain selection group missing")
 	}
-	targetUse, _ := asAnySlice(target["use"])
-	target["use"] = append(targetUse, chainExitProvider)
-	if filter, ok := target["filter"].(string); ok && filter != "" {
-		target["filter"] = "(" + filter + ")|^" + chainExitName + "$"
+	// An include-all selector would also expose the internal entry provider.
+	if selectorTarget["include-all"] == true {
+		selectorTarget["include-all-proxies"] = true
 	}
+	delete(selectorTarget, "include-all")
+	delete(selectorTarget, "include-all-providers")
+	if len(nativeNames) > 0 {
+		if autoTarget == nil {
+			autoTarget = map[string]any{"name": "自动选择", "type": "url-test", "url": "https://www.gstatic.com/generate_204", "interval": 300}
+			ownGroups = append(ownGroups, autoTarget)
+		}
+		// Freeze this group to the original nodes so inline providers cannot
+		// accidentally add either the backup exit or its internal entry nodes.
+		autoTarget["proxies"] = nativeNames
+		for _, key := range []string{"use", "include-all", "include-all-proxies", "include-all-providers", "filter", "exclude-filter"} {
+			delete(autoTarget, key)
+		}
+		choices, _ := asAnySlice(selectorTarget["proxies"])
+		selectorTarget["proxies"] = append([]any{"自动选择"}, choices...)
+	}
+	addExitProvider(selectorTarget)
 	result["proxy-groups"] = append(ownGroups, automatic)
 	return result, nil
 }
 
-func applyInternalChain(base map[string]any, source string) map[string]any {
-	doc, err := fetchInternalChain(source)
+func addExitProvider(group map[string]any) {
+	use, _ := asAnySlice(group["use"])
+	found := false
+	for _, name := range use {
+		if name == chainExitProvider {
+			found = true
+			break
+		}
+	}
+	if !found {
+		group["use"] = append(use, chainExitProvider)
+	}
+	if filter, ok := group["filter"].(string); ok && filter != "" {
+		group["filter"] = "(" + filter + ")|^" + chainExitName + "$"
+	}
+}
+
+func applyInternalChain(base map[string]any, source string, identities []spareIdentity, settings *service.SettingService) (map[string]any, error) {
+	template, err := settings.GetXrayConfigTemplate()
+	var exitRoute spareExitRoute
+	if err == nil {
+		exitRoute, err = resolveSpareExit(template, identities)
+	}
+	var doc map[string]any
+	if err == nil {
+		doc, err = fetchInternalChain(source)
+	}
 	if err == nil {
 		var merged map[string]any
-		merged, err = mergeInternalChain(base, doc, &SubClashService{})
+		merged, err = mergeInternalChain(base, doc, &SubClashService{}, exitRoute)
 		if err == nil {
-			return merged
+			return merged, nil
 		}
 	}
 	// Do not log source URLs or node documents; they may contain credentials.
 	logger.Warning("Backup subscription unavailable; preserving the client's original Clash subscription")
-	return base
+	return base, err
 }
 

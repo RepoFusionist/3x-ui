@@ -1,5 +1,6 @@
 """Generate a Mihomo chain without exposing the upstream subscription URL."""
 import copy
+import base64
 import hashlib
 import ipaddress
 import json
@@ -148,12 +149,13 @@ def generate(prepared, exit_config, template=None):
 
 
 class ChainCache:
-    def __init__(self, config, root, redirect_handler):
+    def __init__(self, config, root, redirect_handler, https_handler):
         self.config, self.root = config, Path(root)
         self.lock = threading.Lock()
         self.refresh_lock = threading.Lock()
         self.entries, self.failures = {}, {}
         self.redirect_handler = redirect_handler
+        self.https_handler = https_handler
         if len(config['sources']) != 1:
             raise ValueError('chain requires one upstream')
         self.default_source_url = config['sources'][0]['url']
@@ -192,7 +194,8 @@ class ChainCache:
             validate_public_dns(source_url)
             request = urllib.request.Request(source_url, headers={
                 'User-Agent': 'clash.meta', 'Accept': 'application/yaml'})
-            opener = urllib.request.build_opener(self.redirect_handler())
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                  self.https_handler(), self.redirect_handler())
             with opener.open(request, timeout=25) as response:
                 if urllib.parse.urlsplit(response.url).scheme != 'https':
                     raise ValueError('insecure redirect')
