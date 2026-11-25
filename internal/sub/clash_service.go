@@ -129,6 +129,7 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool, spare
 			proxies = append(proxies, render()...)
 		}
 	}
+	var sudokuProxy map[string]any
 	for _, ext := range externalLinks {
 		if ext.Enable {
 			hasEnabledClient = true
@@ -138,6 +139,27 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool, spare
 		seenEmails[ext.Email] = struct{}{}
 		if !ext.Active {
 			hasInactiveExternal = true
+			continue
+		}
+		if isClashSudokuGrant(ext) {
+			if !legacy {
+				if proxy := clashProxyFromSudokuFeed(ext.Value, ext.Remark); proxy != nil && proxy["port"] == 443 {
+					sudokuProxy = proxy
+					proxies = append(proxies, proxy)
+				}
+			}
+			continue
+		}
+		if isClashSudokuFeed(ext) {
+			if !legacy {
+				for _, el := range expandEntry(ext) {
+					if proxy := clashProxyFromSudokuFeed(el.Link, ext.Remark); proxy != nil {
+						sudokuProxy = proxy
+						proxies = append(proxies, proxy)
+						break // The local feed represents one independent node.
+					}
+				}
+			}
 			continue
 		}
 		for _, el := range expandEntry(ext) {
@@ -234,6 +256,14 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool, spare
 		}
 	}
 
+	if sudokuProxy != nil {
+		if name, _ := sudokuProxy["name"].(string); name != "" {
+			includeSudokuInClashSelectGroup(config, name)
+		}
+	}
+	if !legacy && !chainRequested {
+		includeStandaloneClashAutomaticGroup(config)
+	}
 	finalYAML, err := marshalClashYAML(config)
 	if err != nil {
 		return "", "", err
@@ -1756,4 +1786,3 @@ func linesToClashRules(raw string) []any {
 	}
 	return rules
 }
-

@@ -83,6 +83,9 @@ func (s *SubService) getClientExternalLinksBySubId(subId string) ([]externalLink
 // expandEntry turns one entry into the concrete share links it contributes.
 // Names are never blank, so Clash/JSON do not fall back to the client email.
 func expandEntry(e externalLinkEntry) []expandedLink {
+	if isClashSudokuGrant(e) {
+		return nil // This account grant is only rendered by the Mihomo subscription.
+	}
 	// This URL is resolved into one structured backup node in the Mihomo
 	// response. Do not also fetch it as an ordinary share-link subscription.
 	if e.Kind == model.ExternalLinkKindSubscription && isInternalChainCandidate(e.Value) {
@@ -224,4 +227,3 @@ func parseExternalLink(rawLink string) map[string]any {
 	}
 	return map[string]any(res.Outbound)
 }
-
